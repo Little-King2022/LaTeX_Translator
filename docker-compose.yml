@@ -1,0 +1,28 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "18000:8000"
+    volumes:
+      - ./workspace:/app/workspace
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:////app/data/app.db
+      - WORKSPACE_DIR=/app/workspace/tasks
+      - APP_USERNAME=${APP_USERNAME:-admin}
+      - APP_PASSWORD=${APP_PASSWORD:-admin}
+      - APP_PASSWORD_HASH=${APP_PASSWORD_HASH:-}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://localhost:18000
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
