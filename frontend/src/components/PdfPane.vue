@@ -1,6 +1,6 @@
 <template>
   <div class="pdf-pane">
-    <div class="pdf-title">{{ title }}</div>
+    <div v-if="showTitle !== false" class="pdf-title">{{ title }}</div>
     <iframe
       v-if="viewerUrl"
       ref="frameEl"
@@ -21,7 +21,8 @@ const props = defineProps({
   title: String,
   url: String,
   scale: Number,
-  refreshKey: Number
+  refreshKey: Number,
+  showTitle: Boolean
 });
 const emit = defineEmits(['scroll']);
 const frameEl = ref(null);

@@ -48,6 +48,10 @@ class TaskCreate(BaseModel):
     llm_config_id: int | None = None
 
 
+class TaskUpdate(BaseModel):
+    name: str = Field(min_length=1)
+
+
 class TaskOut(BaseModel):
     id: str
     name: str
@@ -58,6 +62,7 @@ class TaskOut(BaseModel):
     total_blocks: int
     translated_blocks: int
     failed_blocks: int
+    pending_blocks: int
     llm_config_id: int | None
     error_message: str | None
     created_at: str

@@ -1,7 +1,8 @@
 import json
+from collections import defaultdict
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from app.schemas import (
     LogOut,
     TaskCreate,
     TaskOut,
+    TaskUpdate,
     TranslationBlockOut,
     TranslationBlockUpdate,
 )
@@ -38,7 +40,10 @@ router = APIRouter(prefix="/tasks", tags=["tasks"], dependencies=[Depends(get_cu
 
 @router.get("", response_model=list[TaskOut])
 def list_tasks(db: Session = Depends(db_session)) -> list[Task]:
-    return db.query(Task).order_by(Task.created_at.desc()).all()
+    tasks = db.query(Task).order_by(Task.created_at.desc()).all()
+    for task in tasks:
+        _attach_task_metrics(task)
+    return tasks
 
 
 @router.post("", response_model=TaskOut)
@@ -49,6 +54,16 @@ def create(payload: TaskCreate, db: Session = Depends(db_session)) -> Task:
 @router.get("/{task_id}", response_model=TaskOut)
 def get_task(task_id: str, db: Session = Depends(db_session)) -> Task:
     return _get_task(db, task_id)
+
+
+@router.patch("/{task_id}", response_model=TaskOut)
+def update_task(task_id: str, payload: TaskUpdate, db: Session = Depends(db_session)) -> Task:
+    task = _get_task(db, task_id)
+    task.name = payload.name.strip()
+    db.commit()
+    db.refresh(task)
+    _attach_task_metrics(task)
+    return task
 
 
 @router.delete("/{task_id}")
@@ -201,6 +216,20 @@ def export_glossary(task_id: str, db: Session = Depends(db_session)) -> PlainTex
     return PlainTextResponse(json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json")
 
 
+@router.get("/{task_id}/glossary/conflicts")
+def glossary_conflicts(task_id: str, db: Session = Depends(db_session)) -> list[dict]:
+    _get_task(db, task_id)
+    grouped: dict[str, set[str]] = defaultdict(set)
+    terms = db.query(GlossaryTerm).filter(GlossaryTerm.task_id == task_id).all()
+    for term in terms:
+        grouped[term.source_term.strip()].add(term.target_term.strip())
+    return [
+        {"source_term": source, "target_terms": sorted(targets)}
+        for source, targets in sorted(grouped.items())
+        if source and len(targets) > 1
+    ]
+
+
 @router.get("/{task_id}/blocks", response_model=list[TranslationBlockOut])
 def list_blocks(task_id: str, db: Session = Depends(db_session)) -> list[TranslationBlock]:
     task = _get_task(db, task_id)
@@ -237,6 +266,24 @@ def update_block(task_id: str, block_id: str, payload: TranslationBlockUpdate, d
 async def retranslate_block(task_id: str, block_id: str, db: Session = Depends(db_session)) -> dict[str, bool]:
     _get_task(db, task_id)
     return {"queued": run_background(retranslate_block_task, task_id, block_id)}
+
+
+@router.post("/{task_id}/blocks/batch-retranslate")
+async def batch_retranslate(
+    task_id: str,
+    block_ids: list[str] = Body(...),
+    db: Session = Depends(db_session),
+) -> dict[str, int | bool]:
+    _get_task(db, task_id)
+    if not block_ids:
+        raise HTTPException(status_code=400, detail="No blocks selected")
+    count = (
+        db.query(TranslationBlock)
+        .filter(TranslationBlock.task_id == task_id, TranslationBlock.id.in_(block_ids))
+        .update({TranslationBlock.status: "pending", TranslationBlock.error_message: None}, synchronize_session=False)
+    )
+    db.commit()
+    return {"updated": count, "queued": run_background(translate_task, task_id)}
 
 
 @router.get("/{task_id}/pdf/original")
@@ -298,7 +345,12 @@ def _get_task(db: Session, task_id: str) -> Task:
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    _attach_task_metrics(task)
     return task
+
+
+def _attach_task_metrics(task: Task) -> None:
+    task.pending_blocks = max(task.total_blocks - task.translated_blocks - task.failed_blocks, 0)
 
 
 def _file(path: str | None, filename: str, attachment: bool = False) -> FileResponse:

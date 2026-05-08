@@ -1,5 +1,9 @@
 <template>
-  <router-view v-if="$route.path === '/login'" />
+  <router-view v-if="$route.path === '/login'" v-slot="{ Component }">
+    <Transition name="page-fade" mode="out-in">
+      <component :is="Component" />
+    </Transition>
+  </router-view>
   <div v-else class="app-shell">
     <aside class="sidebar">
       <div class="brand">LaTeX Translator</div>
@@ -9,7 +13,13 @@
       </nav>
       <button class="logout" @click="logout"><LogOut :size="17" />退出</button>
     </aside>
-    <main class="main"><router-view /></main>
+    <main class="main">
+      <router-view v-slot="{ Component }">
+        <Transition name="page-fade" mode="out-in">
+          <component :is="Component" />
+        </Transition>
+      </router-view>
+    </main>
   </div>
 </template>
 
