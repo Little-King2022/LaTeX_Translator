@@ -22,6 +22,7 @@ from app.schemas import (
 from app.services.latex_parser_service import detect_main_tex
 from app.services.latex_project_service import create_task, delete_task_files, save_upload, task_dir
 from app.services.log_service import add_log
+from app.services.glossary_service import read_glossary_progress
 from app.services.comparison_pdf_service import comparison_pdf_path
 from app.workers.runner import run_background
 from app.workers.tasks import (
@@ -230,6 +231,12 @@ def glossary_conflicts(task_id: str, db: Session = Depends(db_session)) -> list[
         for source, targets in sorted(grouped.items())
         if source and len(targets) > 1
     ]
+
+
+@router.get("/{task_id}/glossary/progress")
+def glossary_progress(task_id: str, db: Session = Depends(db_session)) -> dict:
+    _get_task(db, task_id)
+    return read_glossary_progress(task_id)
 
 
 @router.get("/{task_id}/blocks", response_model=list[TranslationBlockOut])

@@ -1,6 +1,8 @@
 import json
 import re
+import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from sqlalchemy.orm import Session
 
@@ -9,8 +11,17 @@ from app.services.latex_parser_service import clean_llm_output
 from app.services.llm_client import LLMClient
 
 
-TERM_TYPES = {"technical_term", "model_name", "dataset_name", "metric", "abbreviation", "do_not_translate"}
+TERM_TYPES = {
+    "technical_term",
+    "model_name",
+    "dataset_name",
+    "metric",
+    "abbreviation",
+    "person_name",
+    "do_not_translate",
+}
 GLOSSARY_TEXT_LIMIT = 12000
+GLOSSARY_PREVIEW_LIMIT = 4000
 FALLBACK_CONTEXT = "Fallback candidate. Please revise before translation."
 STOPWORDS = {
     "a",
@@ -51,34 +62,119 @@ STOPWORDS = {
 
 async def extract_glossary_with_llm(db: Session, task_id: str, client: LLMClient, config) -> list[GlossaryTerm]:
     blocks = db.query(TranslationBlock).filter(TranslationBlock.task_id == task_id).order_by(TranslationBlock.block_index).all()
+    write_glossary_progress(task_id, "preparing", "正在整理可提取术语的论文片段", 20)
     text = _build_glossary_source_text(blocks)
+    write_glossary_progress(task_id, "requesting_llm", "正在请求 LLM 提取术语和人名", 30)
     prompt = """你是农业工程、计算机视觉、深度学习和作物表型分析领域的学术论文术语提取助手。
 
-请从以下英文 LaTeX 论文文本中提取重要术语，并给出推荐中文译名。
+请从以下英文 LaTeX 论文文本中提取重要术语和文中出现的重要人名，并给出推荐中文译名或保留形式。
+你必须输出严格合法的 JSON object。
 
 要求：
-1. 提取专业术语、算法名、模型名、数据集名、评价指标、缩写和不应翻译的专有名词；
+1. 提取专业术语、算法名、模型名、数据集名、评价指标、缩写、人名和不应翻译的专有名词；
 2. 不要提取普通英语单词；
 3. 不要修改 LaTeX 命令、公式、引用和标签；
-4. 输出 JSON 数组；
-5. 每个元素包含 source_term、target_term、term_type、context；
+4. 输出 JSON object，顶层只包含 terms 字段；
+5. terms 是 JSON array，每个元素包含 source_term、target_term、term_type、context；
 6. 对模型名、数据集名、缩写，如果建议保留英文，则 target_term 与 source_term 相同；
-7. 不输出 Markdown，不输出解释。
-8. 必须输出严格合法 JSON，所有键名和字符串必须使用双引号，不能有尾随逗号。
-9. 最多输出 30 个最重要术语。
+7. 对人名使用 term_type="person_name"，优先提取完整姓名，例如 "Li Yan"、"Zhang Lei"、"Geoffrey Hinton"，不要只提取单个姓氏或名字；
+8. 人名出现在作者、致谢、贡献声明、数据采集人员、方法命名来源或正文叙述中时都应提取；不要把引用命令、文献 key、机构名或项目名当做人名；
+9. 人名的 target_term 若无法确定规范中文写法，应与 source_term 保持一致，避免臆造译名；
+10. 不输出 Markdown，不输出解释。
+11. 必须输出严格合法 JSON，所有键名和字符串必须使用双引号，不能有尾随逗号。
+12. 最多输出 40 个最重要条目，其中人名不应被专业术语挤掉。
 
 term_type 只能从以下值中选择：
-technical_term, model_name, dataset_name, metric, abbreviation, do_not_translate
+technical_term, model_name, dataset_name, metric, abbreviation, person_name, do_not_translate
+
+示例 JSON 输出：
+{
+  "terms": [
+    {
+      "source_term": "UAV imagery",
+      "target_term": "无人机影像",
+      "term_type": "technical_term",
+      "context": "UAV imagery was used for plot-level phenotyping."
+    },
+    {
+      "source_term": "Li Yan",
+      "target_term": "Li Yan",
+      "term_type": "person_name",
+      "context": "Acknowledgments: Li Yan contributed to UAV image acquisition."
+    }
+  ]
+}
 """
-    content = await client.chat(
-        [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        top_p=config.top_p,
-        stream=False,
+    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": text}]
+    json_response_format = {"type": "json_object"}
+    content = ""
+    last_progress_at = 0.0
+
+    async def on_delta(_delta: str, accumulated: str) -> None:
+        nonlocal last_progress_at
+        now = time.monotonic()
+        if now - last_progress_at < 0.6 and len(accumulated) < GLOSSARY_PREVIEW_LIMIT:
+            return
+        last_progress_at = now
+        percent = min(70, 35 + len(accumulated) // 600)
+        write_glossary_progress(
+            task_id,
+            "streaming",
+            "LLM 正在返回术语候选",
+            percent,
+            preview=_preview_text(accumulated),
+        )
+
+    try:
+        content = await client.chat_stream(
+            messages,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            top_p=config.top_p,
+            on_delta=on_delta,
+            response_format=json_response_format,
+        )
+    except Exception as exc:
+        write_glossary_progress(
+            task_id,
+            "requesting_llm",
+            f"流式响应不可用，正在切换为普通请求：{exc}",
+            35,
+        )
+    if not content:
+        try:
+            content = await client.chat(
+                messages,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                top_p=config.top_p,
+                stream=False,
+                response_format=json_response_format,
+            )
+        except Exception as exc:
+            write_glossary_progress(
+                task_id,
+                "requesting_llm",
+                f"JSON Output 请求不可用，正在切换为普通请求：{exc}",
+                35,
+            )
+            content = await client.chat(
+                messages,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                top_p=config.top_p,
+                stream=False,
+            )
+    write_glossary_progress(
+        task_id,
+        "parsing_json",
+        "LLM 响应已收到，正在解析 JSON",
+        75,
+        preview=_preview_text(content),
     )
     _write_glossary_raw_log(task_id, content)
     parsed = parse_glossary_json(content)
+    write_glossary_progress(task_id, "saving_terms", f"正在保存 {len(parsed)} 个术语候选", 85, preview=_preview_text(content))
     existing = {term.source_term.lower() for term in db.query(GlossaryTerm).filter(GlossaryTerm.task_id == task_id).all()}
     terms: list[GlossaryTerm] = []
     for item in parsed:
@@ -96,13 +192,89 @@ technical_term, model_name, dataset_name, metric, abbreviation, do_not_translate
             term_type=term_type,
             frequency=1,
             context=str(item.get("context", ""))[:1000],
-            is_locked=term_type in {"model_name", "dataset_name", "abbreviation", "do_not_translate"},
+            is_locked=term_type in {"model_name", "dataset_name", "abbreviation", "person_name", "do_not_translate"},
         )
         db.add(term)
         terms.append(term)
         existing.add(source.lower())
     db.commit()
+    write_glossary_progress(
+        task_id,
+        "completed",
+        f"术语提取完成，新增 {len(terms)} 条",
+        100,
+        preview=_preview_text(content),
+        terms_count=len(terms),
+    )
     return terms
+
+
+def reset_glossary_progress(task_id: str) -> None:
+    write_glossary_progress(task_id, "queued", "术语提取已加入后台队列", 1, preview="", terms_count=0)
+
+
+def write_glossary_progress(
+    task_id: str,
+    status: str,
+    message: str,
+    percent: int,
+    preview: str | None = None,
+    terms_count: int | None = None,
+) -> None:
+    payload = read_glossary_progress(task_id)
+    payload.update(
+        {
+            "status": status,
+            "message": message,
+            "percent": max(0, min(100, percent)),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    )
+    if preview is not None:
+        payload["preview"] = preview
+    if terms_count is not None:
+        payload["terms_count"] = terms_count
+    path = _glossary_progress_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def read_glossary_progress(task_id: str) -> dict:
+    path = _glossary_progress_path(task_id)
+    if not path.exists():
+        return {
+            "status": "idle",
+            "message": "",
+            "percent": 0,
+            "preview": "",
+            "terms_count": 0,
+            "updated_at": None,
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "status": "idle",
+            "message": "",
+            "percent": 0,
+            "preview": "",
+            "terms_count": 0,
+            "updated_at": None,
+        }
+    return data if isinstance(data, dict) else {}
+
+
+def _glossary_progress_path(task_id: str) -> Path:
+    root = Path("workspace/tasks") / task_id
+    if not root.exists():
+        root = Path("/app/workspace/tasks") / task_id
+    return root / "logs" / "glossary_progress.json"
+
+
+def _preview_text(text: str) -> str:
+    return text[-GLOSSARY_PREVIEW_LIMIT:]
 
 
 def parse_glossary_json(content: str) -> list[dict]:

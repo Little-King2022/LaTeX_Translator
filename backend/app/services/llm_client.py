@@ -1,4 +1,5 @@
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ class LLMClient:
         max_tokens: int = 4096,
         top_p: float = 1.0,
         stream: bool = False,
+        response_format: dict[str, str] | None = None,
     ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -30,11 +32,58 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": stream,
         }
+        if response_format:
+            payload["response_format"] = response_format
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(f"{self.base_url}/v1/chat/completions", headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
         return _extract_chat_content(data)
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        top_p: float = 1.0,
+        on_delta: Callable[[str, str], Awaitable[None]] | None = None,
+        response_format: dict[str, str] | None = None,
+    ) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if response_format:
+            payload["response_format"] = response_format
+        chunks: list[str] = []
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream("POST", f"{self.base_url}/v1/chat/completions", headers=headers, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = _extract_stream_delta(data)
+                    if not delta:
+                        continue
+                    chunks.append(delta)
+                    if on_delta:
+                        await on_delta(delta, "".join(chunks))
+        return "".join(chunks)
 
     async def test(self) -> dict[str, Any]:
         text = await self.chat(
@@ -93,6 +142,27 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
         f"(finish_reason={finish_reason!r}, reasoning_content_chars={reasoning_chars}, "
         f"message_keys={message_keys}, usage={usage})"
     )
+
+
+def _extract_stream_delta(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        text = _content_to_text(delta.get("content"))
+        if text:
+            return text
+    message = choice.get("message")
+    if isinstance(message, dict):
+        text = _content_to_text(message.get("content"))
+        if text:
+            return text
+    text = choice.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _content_to_text(content: Any) -> str:

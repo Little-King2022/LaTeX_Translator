@@ -9,7 +9,14 @@ from app.db.database import SessionLocal
 from app.models import GlossaryTerm, LLMConfig, Task, TranslationBlock
 from app.services.comparison_pdf_service import generate_comparison_pdf
 from app.services.compile_service import compile_pdf
-from app.services.glossary_service import FALLBACK_CONTEXT, extract_glossary_with_llm, fallback_candidate_terms, glossary_text
+from app.services.glossary_service import (
+    FALLBACK_CONTEXT,
+    extract_glossary_with_llm,
+    fallback_candidate_terms,
+    glossary_text,
+    reset_glossary_progress,
+    write_glossary_progress,
+)
 from app.services.latex_parser_service import (
     apply_translations,
     clean_llm_output,
@@ -84,6 +91,8 @@ async def extract_glossary_task(task_id: str) -> None:
         task.status = "extracting"
         task.error_message = None
         db.commit()
+        reset_glossary_progress(task.id)
+        write_glossary_progress(task.id, "parsing_blocks", "正在解析 LaTeX 翻译块", 10)
         parse_blocks(db, task)
         removed = (
             db.query(GlossaryTerm)
@@ -99,8 +108,10 @@ async def extract_glossary_task(task_id: str) -> None:
             terms = await extract_glossary_with_llm(db, task.id, client, config)
             add_log(db, task.id, "info", "glossary", f"Extracted {len(terms)} glossary terms")
         except Exception as exc:
+            write_glossary_progress(task.id, "fallback", f"LLM 术语提取失败，正在生成本地候选：{exc}", 80)
             add_log(db, task.id, "error", "glossary", f"LLM glossary extraction failed: {exc}")
             terms = fallback_candidate_terms(db, task.id)
+            write_glossary_progress(task.id, "completed", f"已生成 {len(terms)} 个本地候选术语", 100, terms_count=len(terms))
             add_log(db, task.id, "warning", "glossary", f"Generated {len(terms)} fallback candidate terms")
         task.status = "waiting_glossary_review"
         db.commit()
