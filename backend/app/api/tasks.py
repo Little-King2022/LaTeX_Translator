@@ -48,7 +48,9 @@ def list_tasks(db: Session = Depends(db_session)) -> list[Task]:
 
 @router.post("", response_model=TaskOut)
 def create(payload: TaskCreate, db: Session = Depends(db_session)) -> Task:
-    return create_task(db, payload.name, payload.llm_config_id)
+    task = create_task(db, payload.name, payload.llm_config_id)
+    _attach_task_metrics(task)
+    return task
 
 
 @router.get("/{task_id}", response_model=TaskOut)

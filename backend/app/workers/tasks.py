@@ -35,7 +35,7 @@ def parse_blocks(db: Session, task: Task) -> None:
             continue
         db.add(
             TranslationBlock(
-                id=block.id,
+                id=f"{task.id}-{block.id}",
                 task_id=task.id,
                 file_path=block.file_path,
                 block_index=block.block_index,
