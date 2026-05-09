@@ -479,6 +479,7 @@ const termTypes = ['technical_term', 'model_name', 'dataset_name', 'metric', 'ab
 const termEditReleaseTimers = new Map();
 const editingTermIds = new Set();
 const savingTermIds = new Set();
+const pinnedNewTermIds = [];
 const glossaryReadonlyFields = new Set(['id', 'task_id', 'created_at', 'updated_at']);
 
 const stepByStatus = {
@@ -634,9 +635,20 @@ function isTermLocallyOwned(termId) {
   return editingTermIds.has(termId) || savingTermIds.has(termId);
 }
 
+function pinNewTerm(termId) {
+  const index = pinnedNewTermIds.indexOf(termId);
+  if (index !== -1) pinnedNewTermIds.splice(index, 1);
+  pinnedNewTermIds.unshift(termId);
+}
+
+function unpinNewTerm(termId) {
+  const index = pinnedNewTermIds.indexOf(termId);
+  if (index !== -1) pinnedNewTermIds.splice(index, 1);
+}
+
 function mergeGlossaryFromServer(serverTerms) {
   const localById = new Map(glossary.value.map((term) => [term.id, term]));
-  glossary.value = serverTerms.map((serverTerm) => {
+  const mergedTerms = serverTerms.map((serverTerm) => {
     const localTerm = localById.get(serverTerm.id);
     if (!localTerm || !isTermLocallyOwned(serverTerm.id)) return serverTerm;
 
@@ -645,6 +657,10 @@ function mergeGlossaryFromServer(serverTerms) {
     }
     return localTerm;
   });
+  const mergedById = new Map(mergedTerms.map((term) => [term.id, term]));
+  const pinnedTerms = pinnedNewTermIds.map((termId) => mergedById.get(termId)).filter(Boolean);
+  const pinnedIds = new Set(pinnedTerms.map((term) => term.id));
+  glossary.value = [...pinnedTerms, ...mergedTerms.filter((term) => !pinnedIds.has(term.id))];
 }
 
 function glossaryPayload(row) {
@@ -773,6 +789,8 @@ async function addTerm() {
     context: '',
     is_locked: false,
   });
+  pinNewTerm(data.id);
+  markTermEditing(data.id);
   glossary.value.unshift(data);
 }
 
@@ -787,12 +805,18 @@ async function saveTerm(row) {
     ElMessage.error(err.response?.data?.detail || '术语保存失败，请重试');
   } finally {
     savingTermIds.delete(row.id);
-    if (saved) releaseTermEditing(row.id);
+    if (saved) {
+      unpinNewTerm(row.id);
+      releaseTermEditing(row.id);
+    }
   }
 }
 
 async function removeTerm(id) {
   await api.delete('/tasks/' + taskId + '/glossary/' + id);
+  unpinNewTerm(id);
+  editingTermIds.delete(id);
+  savingTermIds.delete(id);
   glossary.value = glossary.value.filter((t) => t.id !== id);
   ElMessage.success('术语已删除');
 }
