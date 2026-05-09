@@ -186,6 +186,7 @@
 
           <el-table
             :data="filteredTerms"
+            row-key="id"
             stripe
             border
             highlight-current-row
@@ -197,17 +198,39 @@
             </template>
             <el-table-column label="英文术语" min-width="160">
               <template #default="{ row }">
-                <el-input v-model="row.source_term" size="small" class="table-input" @change="saveTerm(row)" />
+                <el-input
+                  v-model="row.source_term"
+                  size="small"
+                  class="table-input"
+                  @focus="markTermEditing(row.id)"
+                  @input="markTermEditing(row.id)"
+                  @blur="releaseTermEditing(row.id)"
+                  @change="saveTerm(row)"
+                />
               </template>
             </el-table-column>
             <el-table-column label="中文译名" min-width="160">
               <template #default="{ row }">
-                <el-input v-model="row.target_term" size="small" class="table-input" @change="saveTerm(row)" />
+                <el-input
+                  v-model="row.target_term"
+                  size="small"
+                  class="table-input"
+                  @focus="markTermEditing(row.id)"
+                  @input="markTermEditing(row.id)"
+                  @blur="releaseTermEditing(row.id)"
+                  @change="saveTerm(row)"
+                />
               </template>
             </el-table-column>
             <el-table-column label="类型" width="180">
               <template #default="{ row }">
-                <el-select v-model="row.term_type" size="small" class="term-type-select" @change="saveTerm(row)">
+                <el-select
+                  v-model="row.term_type"
+                  size="small"
+                  class="term-type-select"
+                  @visible-change="(visible) => handleTermSelectVisible(row.id, visible)"
+                  @change="saveTerm(row)"
+                >
                   <el-option v-for="type in termTypes" :key="type" :label="type" :value="type" />
                 </el-select>
               </template>
@@ -283,11 +306,12 @@
           height="520"
           class="translation-block-table"
           @selection-change="onBlockSelection"
+          row-key="id"
         >
           <template #empty>
             <el-empty description="没有匹配的翻译块" />
           </template>
-          <el-table-column type="selection" width="46" align="center" />
+          <el-table-column type="selection" width="46" align="center" reserve-selection />
           <el-table-column prop="block_index" label="#" width="64" align="center" />
           <el-table-column label="文件" min-width="170" show-overflow-tooltip>
             <template #default="{ row }"><span class="file-path-text">{{ row.file_path }}</span></template>
@@ -452,6 +476,10 @@ const taskNameDraft = ref('');
 const savingTaskName = ref(false);
 let timer;
 const termTypes = ['technical_term', 'model_name', 'dataset_name', 'metric', 'abbreviation', 'do_not_translate', 'custom'];
+const termEditReleaseTimers = new Map();
+const editingTermIds = new Set();
+const savingTermIds = new Set();
+const glossaryReadonlyFields = new Set(['id', 'task_id', 'created_at', 'updated_at']);
 
 const stepByStatus = {
   created: 0,
@@ -574,6 +602,62 @@ function restartPolling() {
   timer = setInterval(load, pollInterval());
 }
 
+function markTermEditing(termId) {
+  if (termId == null) return;
+  const timerId = termEditReleaseTimers.get(termId);
+  if (timerId) {
+    clearTimeout(timerId);
+    termEditReleaseTimers.delete(termId);
+  }
+  editingTermIds.add(termId);
+}
+
+function releaseTermEditing(termId) {
+  if (termId == null || savingTermIds.has(termId)) return;
+  const timerId = termEditReleaseTimers.get(termId);
+  if (timerId) clearTimeout(timerId);
+  termEditReleaseTimers.set(
+    termId,
+    setTimeout(() => {
+      if (!savingTermIds.has(termId)) editingTermIds.delete(termId);
+      termEditReleaseTimers.delete(termId);
+    }, 300)
+  );
+}
+
+function handleTermSelectVisible(termId, visible) {
+  if (visible) markTermEditing(termId);
+  else releaseTermEditing(termId);
+}
+
+function isTermLocallyOwned(termId) {
+  return editingTermIds.has(termId) || savingTermIds.has(termId);
+}
+
+function mergeGlossaryFromServer(serverTerms) {
+  const localById = new Map(glossary.value.map((term) => [term.id, term]));
+  glossary.value = serverTerms.map((serverTerm) => {
+    const localTerm = localById.get(serverTerm.id);
+    if (!localTerm || !isTermLocallyOwned(serverTerm.id)) return serverTerm;
+
+    for (const [key, value] of Object.entries(serverTerm)) {
+      if (glossaryReadonlyFields.has(key)) localTerm[key] = value;
+    }
+    return localTerm;
+  });
+}
+
+function glossaryPayload(row) {
+  return {
+    source_term: row.source_term,
+    target_term: row.target_term,
+    term_type: row.term_type,
+    frequency: row.frequency,
+    context: row.context,
+    is_locked: row.is_locked,
+  };
+}
+
 async function load() {
   const prevStatus = task.value?.status;
   const [taskRes, glossaryRes, blockRes, logRes, comparisonRes, conflictsRes] = await Promise.all([
@@ -585,7 +669,7 @@ async function load() {
     api.get('/tasks/' + taskId + '/glossary/conflicts').catch(() => ({ data: [] })),
   ]);
   task.value = taskRes.data;
-  glossary.value = glossaryRes.data;
+  mergeGlossaryFromServer(glossaryRes.data);
   blocks.value = blockRes.data;
   logs.value = logRes.data;
   comparisonPdfExists.value = comparisonRes.data.exists;
@@ -693,7 +777,18 @@ async function addTerm() {
 }
 
 async function saveTerm(row) {
-  await api.put('/tasks/' + taskId + '/glossary/' + row.id, row);
+  markTermEditing(row.id);
+  savingTermIds.add(row.id);
+  let saved = false;
+  try {
+    await api.put('/tasks/' + taskId + '/glossary/' + row.id, glossaryPayload(row));
+    saved = true;
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || '术语保存失败，请重试');
+  } finally {
+    savingTermIds.delete(row.id);
+    if (saved) releaseTermEditing(row.id);
+  }
 }
 
 async function removeTerm(id) {
@@ -801,6 +896,8 @@ onMounted(() => {
 });
 onUnmounted(() => {
   clearInterval(timer);
+  termEditReleaseTimers.forEach((timerId) => clearTimeout(timerId));
+  termEditReleaseTimers.clear();
   document.removeEventListener('fullscreenchange', updateFullscreenState);
 });
 </script>
