@@ -119,7 +119,21 @@
 
               <div class="action-group">
                 <div class="action-label">3. 提取术语表</div>
-                <el-button :disabled="!task?.original_pdf_path" @click="queue('/extract-glossary')">提取术语</el-button>
+                <el-button
+                  :disabled="!task?.original_pdf_path || task?.status === 'extracting'"
+                  :loading="task?.status === 'extracting'"
+                  @click="extractGlossary"
+                >
+                  提取术语
+                </el-button>
+                <div v-if="showGlossaryProgress" class="glossary-progress-panel compact">
+                  <div class="glossary-progress-head">
+                    <span>{{ glossaryProgressLabel }}</span>
+                    <el-tag size="small" effect="plain">{{ glossaryProgress.status }}</el-tag>
+                  </div>
+                  <el-progress :percentage="glossaryProgressPercent" :stroke-width="8" />
+                  <div class="muted">{{ glossaryProgress.message || '等待后台任务更新' }}</div>
+                </div>
               </div>
 
               <div class="action-group">
@@ -157,6 +171,25 @@
 
       <!-- ==================== 术语库 Tab ==================== -->
       <el-tab-pane label="术语库" name="glossary">
+        <div v-if="showGlossaryProgress" class="glossary-progress-panel">
+          <div class="glossary-progress-head">
+            <div>
+              <div class="action-label">{{ glossaryProgressLabel }}</div>
+              <div class="muted">{{ glossaryProgress.message || '等待后台任务更新' }}</div>
+            </div>
+            <el-tag size="small" effect="plain">{{ glossaryProgress.status }}</el-tag>
+          </div>
+          <el-progress :percentage="glossaryProgressPercent" :stroke-width="10" />
+          <div class="glossary-progress-meta">
+            <span>新增候选：{{ glossaryProgress.terms_count || 0 }}</span>
+            <span>更新：{{ formatDateTime(glossaryProgress.updated_at) }}</span>
+          </div>
+          <div v-if="glossaryProgress.preview" class="llm-preview">
+            <div class="llm-preview-title">LLM 实时响应</div>
+            <pre ref="llmPreviewEl">{{ glossaryProgress.preview }}</pre>
+          </div>
+        </div>
+
         <el-empty v-if="!glossary.length && !termSearch" description="暂无术语，请先提取术语或手动添加">
           <el-button type="primary" @click="addTerm">新增术语</el-button>
         </el-empty>
@@ -437,7 +470,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import {
   Maximize2, Minimize2, Upload
@@ -451,6 +484,7 @@ const taskId = route.params.id;
 const task = ref(null);
 const glossary = ref([]);
 const glossaryConflicts = ref([]);
+const glossaryProgress = ref({ status: 'idle', message: '', percent: 0, preview: '', terms_count: 0, updated_at: null });
 const blocks = ref([]);
 const logs = ref([]);
 const tab = ref('overview');
@@ -458,6 +492,7 @@ const termSearch = ref('');
 const pdfRefresh = ref(0);
 const comparisonPdfExists = ref(false);
 const pdfCompareEl = ref(null);
+const llmPreviewEl = ref(null);
 const isPdfFullscreen = ref(false);
 const blockEditorVisible = ref(false);
 const editingBlockId = ref('');
@@ -475,7 +510,7 @@ const editingTaskName = ref(false);
 const taskNameDraft = ref('');
 const savingTaskName = ref(false);
 let timer;
-const termTypes = ['technical_term', 'model_name', 'dataset_name', 'metric', 'abbreviation', 'do_not_translate', 'custom'];
+const termTypes = ['technical_term', 'model_name', 'dataset_name', 'metric', 'abbreviation', 'person_name', 'do_not_translate', 'custom'];
 const termEditReleaseTimers = new Map();
 const editingTermIds = new Set();
 const savingTermIds = new Set();
@@ -520,6 +555,39 @@ const progress = computed(() => {
 const progressColors = computed(() => {
   if (task.value?.failed_blocks) return '#e6a23c';
   return '#409eff';
+});
+const activeGlossaryProgressStatuses = new Set([
+  'queued',
+  'parsing_blocks',
+  'preparing',
+  'requesting_llm',
+  'streaming',
+  'parsing_json',
+  'saving_terms',
+  'fallback',
+]);
+const showGlossaryProgress = computed(() =>
+  task.value?.status === 'extracting' || activeGlossaryProgressStatuses.has(glossaryProgress.value?.status)
+);
+const glossaryProgressPercent = computed(() => {
+  const value = Number(glossaryProgress.value?.percent || 0);
+  return Math.max(0, Math.min(100, Math.round(value)));
+});
+const glossaryProgressLabel = computed(() => {
+  const labels = {
+    queued: '术语提取排队中',
+    parsing_blocks: '解析 LaTeX',
+    preparing: '整理论文片段',
+    requesting_llm: '请求 LLM',
+    streaming: '接收 LLM 响应',
+    parsing_json: '解析术语 JSON',
+    saving_terms: '保存术语',
+    fallback: '生成本地候选',
+    completed: '术语提取完成',
+    failed: '术语提取失败',
+    idle: '术语提取',
+  };
+  return labels[glossaryProgress.value?.status] || '术语提取';
 });
 const comparisonPdfUrl = computed(() => (comparisonPdfExists.value ? '/tasks/' + taskId + '/pdf/comparison' : ''));
 const originalPdfUrl = computed(() => (task.value?.original_pdf_path ? '/tasks/' + taskId + '/pdf/original' : ''));
@@ -593,7 +661,8 @@ function pollInterval() {
   if (!task.value) return 5000;
   const s = task.value.status;
   if (s === 'translating') return 2000;
-  if (s === 'compiling_original' || s === 'compiling_translated' || s === 'extracting') return 3000;
+  if (s === 'extracting') return 1500;
+  if (s === 'compiling_original' || s === 'compiling_translated') return 3000;
   if (tab.value === 'blocks') return 3000;
   return 8000;
 }
@@ -676,13 +745,14 @@ function glossaryPayload(row) {
 
 async function load() {
   const prevStatus = task.value?.status;
-  const [taskRes, glossaryRes, blockRes, logRes, comparisonRes, conflictsRes] = await Promise.all([
+  const [taskRes, glossaryRes, blockRes, logRes, comparisonRes, conflictsRes, glossaryProgressRes] = await Promise.all([
     api.get('/tasks/' + taskId),
     api.get('/tasks/' + taskId + '/glossary'),
     api.get('/tasks/' + taskId + '/blocks'),
     api.get('/tasks/' + taskId + '/logs'),
     api.get('/tasks/' + taskId + '/pdf/comparison/status'),
     api.get('/tasks/' + taskId + '/glossary/conflicts').catch(() => ({ data: [] })),
+    api.get('/tasks/' + taskId + '/glossary/progress').catch(() => ({ data: glossaryProgress.value })),
   ]);
   task.value = taskRes.data;
   mergeGlossaryFromServer(glossaryRes.data);
@@ -690,6 +760,7 @@ async function load() {
   logs.value = logRes.data;
   comparisonPdfExists.value = comparisonRes.data.exists;
   glossaryConflicts.value = conflictsRes.data || [];
+  glossaryProgress.value = glossaryProgressRes.data || glossaryProgress.value;
 
   if (prevStatus && prevStatus !== taskRes.data.status) {
     const labels = {
@@ -765,6 +836,18 @@ async function confirmTranslate() {
     }
   }
   await queue('/start-translation');
+}
+
+async function extractGlossary() {
+  glossaryProgress.value = {
+    status: 'queued',
+    message: '术语提取已加入后台队列',
+    percent: 1,
+    preview: '',
+    terms_count: 0,
+    updated_at: new Date().toISOString(),
+  };
+  await queue('/extract-glossary');
 }
 
 async function queue(endpoint) {
@@ -913,6 +996,16 @@ function updateFullscreenState() {
   isPdfFullscreen.value = document.fullscreenElement === pdfCompareEl.value;
 }
 
+watch(
+  () => glossaryProgress.value?.preview,
+  async () => {
+    await nextTick();
+    if (llmPreviewEl.value) {
+      llmPreviewEl.value.scrollTop = llmPreviewEl.value.scrollHeight;
+    }
+  }
+);
+
 onMounted(() => {
   load();
   timer = setInterval(load, pollInterval());
@@ -971,6 +1064,63 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.glossary-progress-panel {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #d8e6f8;
+  border-radius: 8px;
+  background: #f7fbff;
+}
+
+.glossary-progress-panel.compact {
+  margin-bottom: 0;
+}
+
+.glossary-progress-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.glossary-progress-meta {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.llm-preview {
+  border-top: 1px solid #dbe7f5;
+  padding-top: 10px;
+}
+
+.llm-preview-title {
+  margin-bottom: 6px;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.llm-preview pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #334155;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .upload-drag {
